@@ -35,7 +35,7 @@ const char* FB_API_KEY   = "AIzaSyAEBkaVsNmojtkwePnQMISElzPNK4nY1ZE";
 const char* FB_PROJECT   = "umbrella-c8cf0";
 const char* DEVICE_EMAIL = "device@umbrella.local";
 const char* DEVICE_PASS  = "device-change-me";
-const char* STATION_CODE = "C3";   // 웹앱 STATIONS 중 live 거점 (형남공학관 2층 입구)
+const char* STATION_CODE = "A1";   // 웹앱 STATIONS 중 live 거점 (형남공학관 2층 입구 · QR A7482)
 const bool  ENABLE_SERVO = true;
 const bool  ENABLE_WIFI  = true;   // false → USB 브리지만
 // =================================
@@ -48,21 +48,22 @@ const bool IR_ACTIVE_LOW = true;
 
 const int DOOR_CLOSED_DEG = 0;
 const int DOOR_OPEN_DEG   = 90;
-const unsigned long STEP_OPEN_MS  = 8;    // 열 때
-const unsigned long STEP_CLOSE_MS = 14;   // 닫을 때 더 부드럽게
-
-const unsigned long RFID_COOLDOWN_MS     = 1500;
-const unsigned long IR_HOLD_MS           = 1000;   // 반납: IR 연속 감지
-const unsigned long IR_GONE_STABLE_MS    = 700;    // 대여: IR 연속 미감지
-const unsigned long OPEN_PRESENT_WAIT_MS = 4000;   // 대여: 처음부터 비어 있으면 꺼냄 감지로 전환
-const unsigned long RETURN_IR_ONLY_MS    = 5000;   // 반납: 태그 없이 IR만 이 시간이면 인정
-const unsigned long AUTO_CLOSE_DELAY_MS  = 2000;   // 감지 후 닫기까지 대기
+const unsigned long RFID_COOLDOWN_MS     = 400;
+const unsigned long IR_HOLD_MS           = 350;    // 반납: 태그 후 IR 연속 감지
+const unsigned long IR_GONE_STABLE_MS    = 250;    // 대여: IR 연속 미감지
+const unsigned long OPEN_PRESENT_WAIT_MS = 700;    // 대여: 처음부터 비어 있으면 꺼냄 감지로 전환
+const unsigned long RETURN_IR_ONLY_MS    = 1800;   // 반납: 태그 없이 IR만 이 시간이면 인정
+const unsigned long AUTO_CLOSE_DELAY_MS  = 300;    // 감지 후 닫기까지 대기
 const unsigned long OPEN_MAX_MS          = 25000;  // 안전: 강제 닫힘
-const unsigned long POLL_MS              = 4000;
+const unsigned long POLL_MS              = 350;    // 명령 폴링 (keep-alive 전제)
+const unsigned long PRESENCE_MS          = 12000;  // 평소 하트비트. IR 변화는 따로
+const unsigned long PRESENCE_BUSY_MS     = 8000;   // 문 감시 중 하트비트
+const unsigned long IR_REPORT_MIN_MS     = 80;     // IR 엣지 디바운스
 const unsigned long WIFI_RETRY_MS        = 10000;
 const unsigned long WIRED_TIMEOUT_MS     = 5000;
 const unsigned long TOKEN_REFRESH_MS     = 50UL * 60UL * 1000UL;
-const unsigned long CMD_MAX_AGE_S        = 120;    // 이보다 오래된 명령은 실행 없이 done
+// 1시간 이내(시계 수 분 오차 포함)만 실행. 그보다 오래면 문 안 열고 done 만.
+const unsigned long CMD_MAX_AGE_S        = 3600UL;
 const int HTTP_BODY_MAX = 6000;
 
 enum DoorState : uint8_t {
@@ -85,6 +86,7 @@ struct Slot {
   unsigned long openedAt = 0;  // 문 연 시각 (OPEN_MAX)
   unsigned long irSince = 0;   // IR 연속 감지/미감지 시작
   bool rfidOk = false;
+  unsigned long senseRfidUntil = 0; // device 테스트: 카드 대기 만료 시각
   String cmd;                  // 문을 연 명령 id (이벤트에 첨부)
 };
 
@@ -94,12 +96,19 @@ WiFiSSLClient ssl;
 bool wiredMode = false;
 unsigned long lastPingMs = 0;
 unsigned long lastPollMs = 0;
+unsigned long lastPresenceMs = 0;
+unsigned long lastIrReportMs = 0;
 unsigned long lastWifiTryMs = 0;
 unsigned long tokenAtMs = 0;
 String idToken;
+int lastHttpStatus = 0;
 String serialBuf;
 String lastCmdId;            // 같은 명령 재실행 방지 (done PATCH 실패 시 재시도만)
 bool netReadyOnce = false;
+bool lastIr1 = false;
+bool lastIr2 = false;
+bool irEdgeInit = false;
+bool presenceDirty = false;  // IR 변화 → 다음 여유 때 presence PATCH (명령보다 후순위)
 
 // HTTP Date / NTP 로 맞춘 UTC 시계 (이벤트 created_at)
 unsigned long clockEpochSec = 0;
@@ -177,26 +186,21 @@ String uidToString(const MFRC522::Uid& uid) {
   return s;
 }
 
-void moveDoor(Slot& s, int target, unsigned long stepMs) {
+void moveDoor(Slot& s, int target) {
+  if (s.angle == target) return;
   Serial.print("[SERVO] slot "); Serial.print(s.id);
   Serial.print(" "); Serial.print(s.angle); Serial.print(" -> "); Serial.println(target);
-  if (!ENABLE_SERVO) { s.angle = target; return; }
-  int step = target > s.angle ? 1 : -1;
-  while (s.angle != target) {
-    s.angle += step;
-    s.servo.write(s.angle);
-    delay(stepMs);
-  }
+  s.angle = target;
+  if (ENABLE_SERVO) s.servo.write(target);
 }
 
 void openDoor(Slot& s) {
-  moveDoor(s, DOOR_OPEN_DEG, STEP_OPEN_MS);
+  moveDoor(s, DOOR_OPEN_DEG);
   recoverRfid();
 }
 
 void closeDoor(Slot& s) {
-  moveDoor(s, DOOR_CLOSED_DEG, STEP_CLOSE_MS);
-  delay(120);
+  moveDoor(s, DOOR_CLOSED_DEG);
   recoverRfid();
 }
 
@@ -215,6 +219,8 @@ void updateLinkMode() {
 
 // ---------- 이벤트 ----------
 void reportEventFirebase(const Slot& s, const char* kind, const String& extra);
+void reportSenseIr(Slot& s);
+void startSenseRfid(Slot& s);
 
 void reportEvent(const Slot& s, const char* kind, const String& extra) {
   if (!isWired()) { reportEventFirebase(s, kind, extra); return; }
@@ -307,8 +313,12 @@ void updateWatch(Slot& s) {
   }
 }
 
-/** RFID: 반납 감시 중일 때만 의미 있음 (평소엔 로그만, 문을 열지 않음) */
+/** RFID: 반납 감시 또는 device 테스트(sense_rfid) 대기 중일 때 이벤트 전송 */
 void handleReader(Slot& s) {
+  if (s.senseRfidUntil && millis() > s.senseRfidUntil) {
+    Serial.print("[RFID] sense timeout slot "); Serial.println(s.id);
+    s.senseRfidUntil = 0;
+  }
   if (!s.rfid.PICC_IsNewCardPresent() || !s.rfid.PICC_ReadCardSerial()) return;
   String uid = uidToString(s.rfid.uid);
   s.rfid.PICC_HaltA();
@@ -319,14 +329,31 @@ void handleReader(Slot& s) {
   if (s.door == RET_WAIT_DETECT && !s.rfidOk) {
     s.rfidOk = true;
     reportEvent(s, "rfid", uid);   // 반납 우산 태그 → umbrellas.tag_uid
+  } else if (s.senseRfidUntil && millis() <= s.senseRfidUntil) {
+    s.senseRfidUntil = 0;
+    reportEvent(s, "rfid", uid);   // device 테스트
   }
+}
+
+/** 장치 테스트 전용. 대여/반납 감시는 시작하지 않는다. */
+void testServo(Slot& s, bool opening, const String& cmdId) {
+  s.door = DOOR_IDLE;
+  s.cmd = cmdId;
+  s.irSince = 0;
+  s.rfidOk = false;
+  if (opening) openDoor(s);
+  else closeDoor(s);
+  presenceDirty = true;
+  reportEvent(s, "servo", opening ? "test_open" : "test_close");
 }
 
 void executeCommand(Slot& s, bool isReturn, const String& cmdId) {
   s.cmd = cmdId;
+  // 서보 먼저 — HTTPS(이벤트/presence)는 문 연 뒤에만
   openDoor(s);
-  reportEvent(s, "servo", isReturn ? "open_return" : "open");
   startWatch(s, isReturn);
+  presenceDirty = true;
+  reportEvent(s, "servo", isReturn ? "open_return" : "open");
 }
 
 // ---------- 시리얼 (USB 브리지) ----------
@@ -337,6 +364,38 @@ void handleSerialLine(String line) {
     lastPingMs = millis();
     wiredMode = true;
     Serial.println("PONG");
+    return;
+  }
+  if (line.startsWith("SENSE_IR ")) {
+    const int slotNo = line.substring(9).toInt();
+    Slot* s = slotByNo(slotNo);
+    if (!s) { Serial.println("ERR SENSE_IR bad slot"); return; }
+    lastPingMs = millis();
+    wiredMode = true;
+    reportSenseIr(*s);
+    return;
+  }
+  if (line.startsWith("SENSE_RFID ")) {
+    const int slotNo = line.substring(11).toInt();
+    Slot* s = slotByNo(slotNo);
+    if (!s) { Serial.println("ERR SENSE_RFID bad slot"); return; }
+    lastPingMs = millis();
+    wiredMode = true;
+    startSenseRfid(*s);
+    Serial.print("ACK SENSE_RFID "); Serial.println(slotNo);
+    return;
+  }
+  if (line.startsWith("TEST_OPEN ") || line.startsWith("TEST_CLOSE ")) {
+    const bool opening = line.startsWith("TEST_OPEN ");
+    const int slotNo = line.substring(opening ? 10 : 11).toInt();
+    Slot* s = slotByNo(slotNo);
+    if (!s) { Serial.println(opening ? "ERR TEST_OPEN bad slot" : "ERR TEST_CLOSE bad slot"); return; }
+    lastPingMs = millis();
+    wiredMode = true;
+    Serial.print("ACK "); Serial.println(opening ? "TEST_OPEN" : "TEST_CLOSE");
+    testServo(*s, opening, "");
+    Serial.print("DONE "); Serial.print(opening ? "TEST_OPEN " : "TEST_CLOSE ");
+    Serial.println(slotNo);
     return;
   }
   const bool isReturn = line.startsWith("OPEN_RETURN ");
@@ -468,25 +527,49 @@ void ensureWifi() {
   waitForNetworkReady();
 }
 
-bool sslConnectWithRetry(const char* host) {
-  for (int i = 1; i <= 3; i++) {
-    if (ssl.connected()) ssl.stop();
-    delay(50);
-    if (ssl.connect(host, 443)) return true;
-    Serial.print("[HTTPS] connect retry "); Serial.println(i);
-    delay(400 * i);
+char sslHost[40] = "";
+bool sslAlive = false;
+
+void sslDrop() {
+  if (ssl.connected()) ssl.stop();
+  sslAlive = false;
+  sslHost[0] = 0;
+}
+
+/** 같은 호스트면 TLS 핸드셰이크를 다시 하지 않는다. 명령 지연의 대부분이 여기였다. */
+bool sslEnsure(const char* host) {
+  if (sslAlive && ssl.connected() && strcmp(sslHost, host) == 0) return true;
+  sslDrop();
+  for (int i = 0; i < 2; i++) {
+    if (ssl.connect(host, 443)) {
+      strncpy(sslHost, host, sizeof(sslHost) - 1);
+      sslHost[sizeof(sslHost) - 1] = 0;
+      sslAlive = true;
+      return true;
+    }
+    delay(40);
   }
   Serial.print("[HTTPS] connect fail "); Serial.println(host);
   return false;
 }
 
 void readBodyBytes(String& out, long remain, unsigned long deadline) {
-  while (remain > 0 && millis() < deadline) {
-    if (!ssl.available()) { delay(2); continue; }
-    int b = ssl.read();
-    if (b < 0) break;
-    if ((int)out.length() < HTTP_BODY_MAX) out += (char)b;
-    remain--;
+  char tmp[161];
+  while (remain > 0 && millis() < deadline && (int)out.length() < HTTP_BODY_MAX) {
+    if (!ssl.available()) {
+      if (!ssl.connected()) break;
+      delay(1);
+      continue;
+    }
+    int want = 160;
+    if ((long)want > remain) want = (int)remain;
+    int room = HTTP_BODY_MAX - (int)out.length();
+    if (want > room) want = room;
+    int n = ssl.read((uint8_t*)tmp, (size_t)want);
+    if (n <= 0) { delay(1); continue; }
+    tmp[n] = 0;
+    out += tmp;
+    remain -= n;
   }
 }
 
@@ -495,11 +578,11 @@ bool httpsRequest(const char* host, const char* method, const String& path,
                   const String& body, const String& bearer, String& responseOut,
                   int timeoutMs = 20000) {
   responseOut = "";
-  if (!waitForNetworkReady() || !sslConnectWithRetry(host)) return false;
+  if (!waitForNetworkReady() || !sslEnsure(host)) return false;
 
   ssl.print(method); ssl.print(" "); ssl.print(path); ssl.println(" HTTP/1.1");
   ssl.print("Host: "); ssl.println(host);
-  ssl.println("Connection: close");
+  ssl.println("Connection: keep-alive");
   ssl.println("Accept: application/json");
   ssl.println("Accept-Encoding: identity");
   ssl.println("User-Agent: UmbrellaLocker/2.0");
@@ -515,18 +598,22 @@ bool httpsRequest(const char* host, const char* method, const String& path,
   ssl.flush();
 
   const unsigned long deadline = millis() + (unsigned long)timeoutMs;
-  while (!ssl.available() && millis() < deadline) delay(10);
+  while (!ssl.available() && millis() < deadline) delay(1);
   if (!ssl.available()) {
     Serial.println("[HTTPS] no response");
-    ssl.stop();
+    sslDrop();
     return false;
   }
 
   String statusLine = ssl.readStringUntil('\n');
   statusLine.trim();
-  const bool ok = statusLine.indexOf(" 200") >= 0 || statusLine.indexOf(" 201") >= 0;
+  lastHttpStatus = 0;
+  const int sp = statusLine.indexOf(' ');
+  if (sp >= 0) lastHttpStatus = statusLine.substring(sp + 1).toInt();
+  const bool ok = lastHttpStatus == 200 || lastHttpStatus == 201;
 
   bool chunked = false;
+  bool respClose = false;
   long contentLength = -1;
   while (millis() < deadline) {
     if (!ssl.available()) {
@@ -541,6 +628,7 @@ bool httpsRequest(const char* host, const char* method, const String& path,
     low.toLowerCase();
     if (low.startsWith("transfer-encoding:") && low.indexOf("chunked") >= 0) chunked = true;
     else if (low.startsWith("content-length:")) contentLength = low.substring(15).toInt();
+    else if (low.startsWith("connection:") && low.indexOf("close") >= 0) respClose = true;
     else if (low.startsWith("date:")) {
       unsigned long t = parseHttpDate(line.substring(5));
       if (t > 1700000000UL) setClock(t);
@@ -570,7 +658,8 @@ bool httpsRequest(const char* host, const char* method, const String& path,
       delay(5);
     }
   }
-  ssl.stop();
+  // 길이를 모르면 소켓을 비워 둔 채 재사용하면 다음 응답이 어긋난다
+  if (respClose || !ok || (!chunked && contentLength < 0)) sslDrop();
 
   if (!ok) {
     Serial.print("[HTTPS] "); Serial.println(statusLine);
@@ -617,7 +706,8 @@ bool firestoreWrite(const char* method, const String& path, const String& body) 
   if (!firebaseLogin()) return false;
   String resp;
   if (httpsRequest("firestore.googleapis.com", method, path, body, idToken, resp)) return true;
-  // 토큰 만료 가능 → 재로그인 후 1회 재시도
+  // 400은 JSON 오류 — 재로그인해도 같은 본문이 또 거절되고 루프만 멈춘다
+  if (lastHttpStatus != 401 && lastHttpStatus != 403) return false;
   if (!firebaseLogin(true)) return false;
   return httpsRequest("firestore.googleapis.com", method, path, body, idToken, resp);
 }
@@ -632,10 +722,16 @@ bool markCommandDone(const String& docId) {
 }
 
 void reportEventFirebase(const Slot& s, const char* kind, const String& extra) {
+  // 각 값은 반드시 닫는다. "present":{"booleanValue":true,"source":{...}} 처럼
+  // 다음 키를 값 안에 넣으면 Firestore 400 (Unknown name "source") 이 난다.
   String payload;
-  if (strcmp(kind, "rfid") == 0) payload = String("\"uid\":{\"stringValue\":\"") + extra + "\"}";
-  else if (strcmp(kind, "return_ok") == 0) payload = String("\"source\":{\"stringValue\":\"") + extra + "\"}";
-  else payload = String("\"action\":{\"stringValue\":\"") + extra + "\"},\"deg\":{\"integerValue\":\"" + DOOR_OPEN_DEG + "\"}";
+  if (strcmp(kind, "rfid") == 0) {
+    payload = String("\"uid\":{\"stringValue\":\"") + extra + "\"}";
+  } else if (strcmp(kind, "return_ok") == 0) {
+    payload = String("\"via\":{\"stringValue\":\"") + extra + "\"}";
+  } else {
+    payload = String("\"action\":{\"stringValue\":\"") + extra + "\"},\"deg\":{\"integerValue\":\"" + String(DOOR_OPEN_DEG) + "\"}";
+  }
 
   const String created = epochMsString();
   String body = String("{\"fields\":{") +
@@ -657,22 +753,149 @@ void reportEventFirebase(const Slot& s, const char* kind, const String& extra) {
   }
 }
 
-/** stations/{code} 하트비트 — 장치 화면 / 앱의 "보드 온라인" 판단 */
-void reportPresence() {
+/** stations/{code} 하트비트 — 장치 화면 / 앱의 "보드 온라인" 판단 (+ IR 스냅샷) */
+bool reportPresence() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!firebaseLogin()) return false;
   IPAddress ip = WiFi.localIP();
+  const bool ir1 = irPresent(slots[0]);
+  const bool ir2 = irPresent(slots[1]);
+  lastIr1 = ir1;
+  lastIr2 = ir2;
+  irEdgeInit = true;
   String body = String("{\"fields\":{") +
                 "\"code\":{\"stringValue\":\"" + STATION_CODE + "\"}," +
                 "\"last_seen\":{\"integerValue\":\"" + epochMsString() + "\"}," +
                 "\"link\":{\"stringValue\":\"wifi\"}," +
                 "\"wifi_rssi\":{\"integerValue\":\"" + String((long)WiFi.RSSI()) + "\"}," +
                 "\"wifi_ip\":{\"stringValue\":\"" + String(ip[0]) + "." + ip[1] + "." + ip[2] + "." + ip[3] + "\"}," +
+                "\"ir1\":{\"booleanValue\":" + String(ir1 ? "true" : "false") + "}," +
+                "\"ir2\":{\"booleanValue\":" + String(ir2 ? "true" : "false") + "}," +
                 "\"mcu_ok\":{\"booleanValue\":true}}}";
-  firestoreWrite("PATCH", firestorePath(String("/stations/") + STATION_CODE +
+  bool ok = firestoreWrite("PATCH", firestorePath(String("/stations/") + STATION_CODE +
                  "?updateMask.fieldPaths=code&updateMask.fieldPaths=last_seen&updateMask.fieldPaths=link" +
-                 "&updateMask.fieldPaths=wifi_rssi&updateMask.fieldPaths=wifi_ip&updateMask.fieldPaths=mcu_ok"), body);
+                 "&updateMask.fieldPaths=wifi_rssi&updateMask.fieldPaths=wifi_ip" +
+                 "&updateMask.fieldPaths=ir1&updateMask.fieldPaths=ir2&updateMask.fieldPaths=mcu_ok"), body);
+  if (ok) lastPresenceMs = millis();
+  return ok;
 }
 
-/** station==STATION_CODE && done==0 인 가장 오래된 명령 1건 실행 */
+/** IR 엣지: HTTPS 하지 않고 플래그만 — 명령 폴링을 막지 않음 */
+void pollIrEdges() {
+  const bool ir1 = irPresent(slots[0]);
+  const bool ir2 = irPresent(slots[1]);
+  if (!irEdgeInit) {
+    lastIr1 = ir1;
+    lastIr2 = ir2;
+    irEdgeInit = true;
+    return;
+  }
+  if (ir1 == lastIr1 && ir2 == lastIr2) return;
+  if (millis() - lastIrReportMs < IR_REPORT_MIN_MS) return;
+  lastIrReportMs = millis();
+
+  if (ir1 != lastIr1) {
+    Serial.print("[IR] edge slot1 ");
+    Serial.println(ir1 ? "present" : "empty");
+    if (isWired()) { Serial.print("EVENT IR 1 "); Serial.println(ir1 ? "1" : "0"); }
+  }
+  if (ir2 != lastIr2) {
+    Serial.print("[IR] edge slot2 ");
+    Serial.println(ir2 ? "present" : "empty");
+    if (isWired()) { Serial.print("EVENT IR 2 "); Serial.println(ir2 ? "1" : "0"); }
+  }
+  lastIr1 = ir1;
+  lastIr2 = ir2;
+  presenceDirty = true;  // stations.ir1/ir2 만 빠르게 PATCH
+}
+
+void reportSenseIr(Slot& s) {
+  const bool present = irPresent(s);
+  Serial.print("[IR] slot "); Serial.print(s.id);
+  Serial.println(present ? " present" : " empty");
+  if (isWired()) {
+    Serial.print("EVENT IR "); Serial.print(s.id); Serial.print(" ");
+    Serial.println(present ? "1" : "0");
+    return;
+  }
+  // 즉시 PATCH 하지 않고 dirty — 명령 폴링과 경합하지 않음
+  presenceDirty = true;
+}
+
+void startSenseRfid(Slot& s) {
+  s.senseRfidUntil = millis() + 15000UL;
+  Serial.print("[RFID] sense window 15s slot "); Serial.println(s.id);
+}
+
+/** 대기 명령 1건 처리. true = 서보를 열어 문 감시 시작 → 추가 HTTPS 중단 */
+bool handleOneCommand(const String& resp, int docPos, int docEnd) {
+  String fullName = jsonString(resp, "name", docPos);
+  const String docId = fullName.substring(fullName.lastIndexOf('/') + 1);
+  if (!docId.length()) return false;
+  const int slotNo = fieldValue(resp, "slot", "integerValue", docPos, docEnd).toInt();
+  const String action = fieldValue(resp, "action", "stringValue", docPos, docEnd);
+  const bool isReturn = action == "open_return";
+  const bool senseIr = action == "sense_ir";
+  const bool senseRfid = action == "sense_rfid";
+  const unsigned long createdSec = msStringToSec(fieldValue(resp, "created_at", "integerValue", docPos, docEnd));
+  const unsigned long nowSec = nowEpochSec();
+
+  Serial.print("[CMD] id="); Serial.print(docId);
+  Serial.print(" slot="); Serial.print(slotNo);
+  Serial.print(" "); Serial.println(action);
+
+  Slot* s = slotByNo(slotNo);
+  if (!s) {
+    Serial.println("[CMD] invalid slot → done");
+    markCommandDone(docId);
+    return false;
+  }
+  if (nowSec && createdSec) {
+    long ageS = (long)nowSec - (long)createdSec;
+    Serial.print("[CMD] now="); Serial.print(nowSec);
+    Serial.print(" created="); Serial.print(createdSec);
+    Serial.print(" age_s="); Serial.println(ageS);
+    if (ageS > (long)CMD_MAX_AGE_S) {
+      Serial.println("[CMD] stale (>1h) → done without opening");
+      markCommandDone(docId);
+      return false;
+    }
+  }
+  if (docId == lastCmdId) {       // 이전 done PATCH 실패 → 문 다시 열지 않고 done만 재시도
+    markCommandDone(docId);
+    return false;
+  }
+  lastCmdId = docId;
+  if (senseIr) {
+    // presence만 갱신 (별도 device_events HTTPS 생략) — 명령 큐를 막지 않음
+    presenceDirty = true;
+    markCommandDone(docId);
+    return false;
+  }
+  if (senseRfid) {
+    startSenseRfid(*s);
+    markCommandDone(docId);
+    return false;
+  }
+  if (action == "test_open" || action == "test_close") {
+    Serial.println(action == "test_open" ? "[CMD] test open" : "[CMD] test close");
+    testServo(*s, action == "test_open", docId);
+    markCommandDone(docId);
+    return false;
+  }
+  if (action != "open" && action != "open_return") {
+    Serial.println("[CMD] unknown action → done");
+    markCommandDone(docId);
+    return false;
+  }
+  Serial.println("[CMD] execute open now");
+  executeCommand(*s, isReturn, docId);
+  markCommandDone(docId);
+  presenceDirty = true;
+  return true;  // 문 감시 시작 → 추가 명령은 다음 폴링
+}
+
+/** station==STATION_CODE && done==0 — presence HTTPS 없이 명령만 (서보 지연 제거) */
 void pollCommands() {
   ensureWifi();
   if (WiFi.status() != WL_CONNECTED) { Serial.println("[POLL] WiFi 끊김"); return; }
@@ -682,49 +905,25 @@ void pollCommands() {
                 "\"where\":{\"compositeFilter\":{\"op\":\"AND\",\"filters\":[" +
                 "{\"fieldFilter\":{\"field\":{\"fieldPath\":\"station\"},\"op\":\"EQUAL\",\"value\":{\"stringValue\":\"" + STATION_CODE + "\"}}}," +
                 "{\"fieldFilter\":{\"field\":{\"fieldPath\":\"done\"},\"op\":\"EQUAL\",\"value\":{\"integerValue\":\"0\"}}}]}}," +
-                "\"orderBy\":[{\"field\":{\"fieldPath\":\"created_at\"},\"direction\":\"ASCENDING\"}],\"limit\":3}}";
+                "\"orderBy\":[{\"field\":{\"fieldPath\":\"created_at\"},\"direction\":\"ASCENDING\"}],\"limit\":2}}";
   String resp;
   const String path = firestorePath(":runQuery");
-  if (!httpsRequest("firestore.googleapis.com", "POST", path, body, idToken, resp, 15000)) {
+  if (!httpsRequest("firestore.googleapis.com", "POST", path, body, idToken, resp, 8000)) {
+    if (lastHttpStatus != 401 && lastHttpStatus != 403) return;
     if (!firebaseLogin(true)) return;
-    if (!httpsRequest("firestore.googleapis.com", "POST", path, body, idToken, resp, 15000)) return;
+    if (!httpsRequest("firestore.googleapis.com", "POST", path, body, idToken, resp, 8000)) return;
   }
-  reportPresence();   // Firestore 왕복 성공 → 하트비트
 
-  const int docPos = resp.indexOf("\"document\"");
-  if (docPos < 0) return;   // 대기 명령 없음
-  const int docEnd = resp.indexOf("\"document\"", docPos + 10);
-
-  String fullName = jsonString(resp, "name", docPos);
-  const String docId = fullName.substring(fullName.lastIndexOf('/') + 1);
-  if (!docId.length()) return;
-  const int slotNo = fieldValue(resp, "slot", "integerValue", docPos, docEnd).toInt();
-  const bool isReturn = fieldValue(resp, "action", "stringValue", docPos, docEnd) == "open_return";
-  const unsigned long createdSec = msStringToSec(fieldValue(resp, "created_at", "integerValue", docPos, docEnd));
-  const unsigned long nowSec = nowEpochSec();
-
-  Serial.print("[CMD] id="); Serial.print(docId);
-  Serial.print(" slot="); Serial.print(slotNo);
-  Serial.println(isReturn ? " open_return" : " open");
-
-  Slot* s = slotByNo(slotNo);
-  if (!s) {
-    Serial.println("[CMD] invalid slot → done");
-    markCommandDone(docId);
-    return;
+  // 오래된 sense/stale 이 앞에 있어도 같은 응답에서 연속 처리 → open이 막히지 않음
+  int searchFrom = 0;
+  for (int n = 0; n < 5; n++) {
+    const int docPos = resp.indexOf("\"document\"", searchFrom);
+    if (docPos < 0) break;
+    const int nextDoc = resp.indexOf("\"document\"", docPos + 10);
+    const int docEnd = nextDoc < 0 ? (int)resp.length() : nextDoc;
+    searchFrom = docPos + 10;
+    if (handleOneCommand(resp, docPos, docEnd)) break;
   }
-  if (nowSec && createdSec && nowSec > createdSec + CMD_MAX_AGE_S) {
-    Serial.println("[CMD] stale (>2min) → done without opening");
-    markCommandDone(docId);
-    return;
-  }
-  if (docId == lastCmdId) {       // 이전 done PATCH 실패 → 문 다시 열지 않고 done만 재시도
-    markCommandDone(docId);
-    return;
-  }
-  lastCmdId = docId;
-  executeCommand(*s, isReturn, docId);
-  markCommandDone(docId);
 }
 
 // ---------- 메인 ----------
@@ -732,7 +931,7 @@ void setup() {
   Serial.begin(9600);
   while (!Serial && millis() < 3000) {}
   delay(200);
-  Serial.println("[BOOT] UmbrellaLocker v2 — command-driven doors");
+  Serial.println("[BOOT] UmbrellaLocker v4 — fast poll, keep-alive, instant servo");
 
   for (int i = 0; i < 2; i++) {
     pinMode(SS_PINS[i], OUTPUT);
@@ -749,7 +948,7 @@ void setup() {
     if (ENABLE_SERVO) {
       s.servo.attach(SERVO_PINS[i]);
       s.servo.write(DOOR_CLOSED_DEG);
-      delay(500);
+      delay(150);
     }
   }
 
@@ -770,9 +969,22 @@ void loop() {
     handleReader(s);
   }
   if (isWired()) return;   // 브리지가 PING 중이면 WiFi 폴링 안 함
-  if (slots[0].door != DOOR_IDLE || slots[1].door != DOOR_IDLE) return;   // 문 감시 중엔 HTTPS 쉬기
-  if (millis() - lastPollMs >= POLL_MS) {
+
+  pollIrEdges();  // 로컬만 (HTTPS 없음)
+
+  const bool doorBusy = (slots[0].door != DOOR_IDLE || slots[1].door != DOOR_IDLE);
+
+  // 문이 닫혀 있으면 명령 폴링이 먼저 — 웹에서 열기까지 기다리는 시간
+  if (!doorBusy && millis() - lastPollMs >= POLL_MS) {
     lastPollMs = millis();
     pollCommands();
+    return;
+  }
+
+  // 문 감시 중이거나 폴링 간격 사이에는 IR·하트비트
+  const unsigned long presenceEvery = doorBusy ? PRESENCE_BUSY_MS : PRESENCE_MS;
+  if (presenceDirty || millis() - lastPresenceMs >= presenceEvery) {
+    presenceDirty = false;
+    reportPresence();
   }
 }

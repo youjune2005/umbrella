@@ -14,9 +14,9 @@ const DEVICE_KEY = process.env.DEVICE_KEY || "umbrella-device";
 const MAX_HW_SLOT = 2;
 const RENT_LIMIT_MS = 48 * 3600 * 1000;
 const STATIONS = [
-  ["A1", "학생회관 정문"],
+  ["A1", "형남공학관 2층 입구"],
   ["B2", "중앙도서관 출입구"],
-  ["C3", "형남공학관 2층 입구"],
+  ["C3", "학생회관 정문"],
 ];
 
 // ---------- DB ----------
@@ -169,11 +169,16 @@ const checkPw = (pw, stored) => {
   const hb = Buffer.from(h, "hex");
   return t.length === hb.length && crypto.timingSafeEqual(t, hb);
 };
-const getLanIPs = () =>
-  Object.values(os.networkInterfaces())
-    .flat()
-    .filter((n) => n && n.family === "IPv4" && !n.internal)
-    .map((n) => n.address);
+const getLanIPs = () => {
+  try {
+    return Object.values(os.networkInterfaces() || {})
+      .flat()
+      .filter((n) => n && n.family === "IPv4" && !n.internal)
+      .map((n) => n.address);
+  } catch (_) {
+    return [];
+  }
+};
 
 const toStation = (v) => String(v || "").toUpperCase();
 const toSlot = (v) => Number(v);
@@ -384,7 +389,7 @@ app.post("/api/device/presence", requireDeviceKey, (req, res) => {
 app.get("/api/device/presence", (req, res) => {
   const station = toStation(req.query.station || "A1");
   const row = devicePresence[station] || null;
-  const ONLINE_MS = 20000;
+  const ONLINE_MS = 60000;
   res.json({
     station,
     online: !!(row && row.last_seen && nowFresh(row.last_seen, ONLINE_MS)),

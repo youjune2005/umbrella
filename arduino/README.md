@@ -22,7 +22,7 @@ const char* WIFI_PASS = "비밀번호";
 ## 유선으로 바로 테스트
 
 1. 시리얼 모니터를 **닫고** (포트 점유 주의)
-2. 프로젝트 루트: `npm run bridge:firebase`  (거점 기본값 C3. 다른 거점이면 `STATION=A1 npm run bridge:firebase`)
+2. 프로젝트 루트: `npm run bridge:firebase`  (거점 기본값 A1/형남. 다른 거점이면 `STATION=C3 npm run bridge:firebase`)
 3. https://umbrella-c8cf0.web.app/device.html 에서 문열기
 
 웹 반납은 Firestore `commands.action = open_return` 을 넣고, 보드는 IR(+RFID) 확인 후 `return_ok` → `auto_close_return` 이벤트를 올립니다. 앱은 그 이벤트를 보고 문을 닫습니다.

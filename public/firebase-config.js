@@ -2,8 +2,8 @@
 window.UMBRELLA = {
   backend: "firebase",
   cost: {
-    bridgePollMs: 4000,
-    uiRefreshMs: 10000,
+    bridgePollMs: 400,
+    uiRefreshMs: 2000,
     maxHwSlot: 2
   },
   firebase: {

@@ -17,7 +17,10 @@ service cloud.firestore {
       return slot is int && slot >= 1 && slot <= 2;
     }
     function validCommandAction(action) {
-      return action in ['open', 'open_return'];
+      return action in ['open', 'open_return', 'sense_ir', 'sense_rfid', 'test_open', 'test_close'];
+    }
+    function deviceTestAction(action) {
+      return action in ['test_open', 'test_close'];
     }
 
     // 사용자 프로필 — 본인 또는 device(관리)만
@@ -77,7 +80,8 @@ service cloud.firestore {
         && validSlot(request.resource.data.slot)
         && validCommandAction(request.resource.data.action)
         && request.resource.data.done == 0
-        && request.resource.data.done_at == null;
+        && request.resource.data.done_at == null
+        && (!deviceTestAction(request.resource.data.action) || isDevice());
       allow update: if isDevice()
         && request.resource.data.done == 1
         && resource.data.done == 0;

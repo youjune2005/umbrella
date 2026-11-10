@@ -12,8 +12,8 @@ import {
 } from "../public/js/device-protocol.js";
 
 const stations = [
-  { code: "A1", live: false },
-  { code: "C3", live: true },
+  { code: "A1", live: true },
+  { code: "C3", live: false },
 ];
 
 let failed = 0;
@@ -26,7 +26,7 @@ function assert(name, cond) {
 }
 
 console.log("[sim] device protocol");
-assert("live station is C3", liveStationCode(stations) === "C3");
+assert("live station is A1", liveStationCode(stations) === "A1");
 assert("rent command is open", commandAction(false) === "open");
 assert("return command is open_return", commandAction(true) === "open_return");
 
@@ -39,19 +39,19 @@ assert("return close timeout", isReturnDoorClosed({ kind: "servo", payload: { ac
 
 const now = Date.now();
 const rows = [
-  { station: "C3", slot: 1, kind: "servo", payload: { action: "open" }, created_at: now - 2000 },
-  { station: "C3", slot: 1, kind: "return_ok", payload: { source: "ir" }, created_at: now - 1000 },
-  { station: "C3", slot: 1, kind: "servo", payload: { action: "auto_close_return" }, created_at: now },
-  { station: "C3", slot: 2, kind: "servo", payload: { action: "auto_close" }, created_at: now },
+  { station: "A1", slot: 1, kind: "servo", payload: { action: "open" }, created_at: now - 2000 },
+  { station: "A1", slot: 1, kind: "return_ok", payload: { source: "ir" }, created_at: now - 1000 },
+  { station: "A1", slot: 1, kind: "servo", payload: { action: "auto_close_return" }, created_at: now },
+  { station: "A1", slot: 2, kind: "servo", payload: { action: "auto_close" }, created_at: now },
 ];
 assert(
   "pick return close for slot 1",
-  pickMatchingEvent(rows, { station: "C3", slot: 1, since: now - 5000, match: isReturnDoorClosed })
+  pickMatchingEvent(rows, { station: "A1", slot: 1, since: now - 5000, match: isReturnDoorClosed })
     ?.payload.action === "auto_close_return"
 );
 assert(
   "pick rent close for slot 2",
-  pickMatchingEvent(rows, { station: "C3", slot: 2, since: now - 5000, match: isRentDoorClosed })
+  pickMatchingEvent(rows, { station: "A1", slot: 2, since: now - 5000, match: isRentDoorClosed })
     ?.payload.action === "auto_close"
 );
 assert("zero created_at still matches", eventTimeOk({ created_at: 0 }, now));

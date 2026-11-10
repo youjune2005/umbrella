@@ -11,7 +11,7 @@ export const EVENT_SINCE_SLACK_MS = 8000;
 
 export function liveStationCode(stations) {
   const s = (stations || []).find((x) => x.live);
-  return (s && s.code) || "C3";
+  return (s && s.code) || "A1";
 }
 
 export function commandAction(isReturn) {

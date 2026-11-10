@@ -9,14 +9,14 @@ import {
   getMyActiveRental,
   rentUmbrella,
   returnUmbrella,
-  getRecentDeviceEvent,
+  watchDeviceEvents,
   friendlyError,
   MAX_HW_SLOT,
   TOTAL_SLOTS,
   RENT_LIMIT_MS,
   overdueFeeWon,
   STATIONS,
-} from "/js/backend.js";
+} from "/js/backend.js?v=96";
 import { startQrScan, stopQrScan, setScanCooldown, setTorch, getTorchOn, fitQrVideoCover } from "/js/qr-scan.js?v=49";
 import {
   initCampusMap,
@@ -25,13 +25,14 @@ import {
   resizeCampusMap,
   summarizeSlots,
   plannedSlotDetail,
-} from "/js/map-view.js";
+} from "/js/map-view.js?v=92";
 import { initUiScale, updateUiScale, setShellScrollLock } from "/js/ui-scale.js?v=64";
 import {
   isRentDoorClosed,
   isReturnDetected,
   isReturnDoorClosed,
-} from "/js/device-protocol.js?v=53";
+  pickMatchingEvent,
+} from "/js/device-protocol.js?v=96";
 
 initUiScale();
 
@@ -60,7 +61,6 @@ const DOOR_MS = 720;
 const QR_CONFIRM_HITS = 3; // 같은 코드가 연속 인식돼야 확정
 /** 보드 자동닫힘 대기 (아두이노 OPEN_MAX ≈ 25s + 여유) */
 const DOOR_SENSOR_TIMEOUT_MS = 45000;
-const DOOR_POLL_MS = 700;
 
 const state = {
   user: null,
@@ -643,75 +643,65 @@ function render() {
   syncPickActions();
 }
 
-/** 대여: IR로 우산이 사라진 뒤 보드가 문을 닫을 때까지 대기 */
-async function waitForRentDoorClose(station, slot, sinceMs) {
-  const start = Date.now();
-  while (Date.now() - start < DOOR_SENSOR_TIMEOUT_MS) {
-    try {
-      const ev = await getRecentDeviceEvent({
-        station,
-        slot,
-        since: sinceMs,
-        match: isRentDoorClosed,
-      });
-      if (ev) {
-        const action = String((ev.payload && ev.payload.action) || "");
-        return /timeout/i.test(action) ? "timeout" : "sensor";
-      }
-    } catch (_) { /* keep waiting */ }
-    await wait(DOOR_POLL_MS);
+function listenForDoor(station, onRows) {
+  try {
+    return watchDeviceEvents(station, onRows) || (() => {});
+  } catch (_) {
+    return () => {};
   }
-  return "timeout";
+}
+
+/** 대여: IR로 우산이 사라진 뒤 보드가 문을 닫을 때까지 대기 */
+function waitForRentDoorClose(station, slot, sinceMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let stop = () => {};
+    const finish = (how) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { stop(); } catch (_) { /* ignore */ }
+      resolve(how);
+    };
+    const timer = setTimeout(() => finish("timeout"), DOOR_SENSOR_TIMEOUT_MS);
+    stop = listenForDoor(station, (rows) => {
+      const ev = pickMatchingEvent(rows, { station, slot, since: sinceMs, match: isRentDoorClosed });
+      if (!ev) return;
+      const action = String((ev.payload && ev.payload.action) || "");
+      finish(/timeout/i.test(action) ? "timeout" : "sensor");
+    });
+  });
 }
 
 /**
  * 반납: RFID+IR 인식(return_ok) 후 보드 자동닫힘(auto_close_return)까지 대기.
  * 수동 「우산을 넣었어요」는 보드 없이 닫기 위한 폴백.
  */
-async function waitForReturnDoorClose(station, slot, sinceMs) {
+function waitForReturnDoorClose(station, slot, sinceMs) {
   return new Promise((resolve) => {
     let settled = false;
     let sawReturnOk = false;
+    let stop = () => {};
     const finish = (how) => {
       if (settled) return;
       settled = true;
       returnWaitResolve = null;
+      clearTimeout(timer);
+      try { stop(); } catch (_) { /* ignore */ }
       resolve(how);
     };
     returnWaitResolve = () => finish("manual");
-
-    (async () => {
-      const start = Date.now();
-      while (!settled && Date.now() - start < DOOR_SENSOR_TIMEOUT_MS) {
-        try {
-          if (!sawReturnOk) {
-            const ok = await getRecentDeviceEvent({
-              station,
-              slot,
-              since: sinceMs,
-              match: isReturnDetected,
-            });
-            if (ok) {
-              sawReturnOk = true;
-              setMsg("우산이 인식됐어요. 문이 닫힐 때까지 기다려 주세요.");
-            }
-          }
-          const closed = await getRecentDeviceEvent({
-            station,
-            slot,
-            since: sinceMs,
-            match: isReturnDoorClosed,
-          });
-          if (closed) {
-            const action = String((closed.payload && closed.payload.action) || "");
-            finish(/timeout/i.test(action) ? "timeout" : "sensor");
-            return;
-          }
-        } catch (_) { /* keep waiting */ }
-        await wait(DOOR_POLL_MS);
+    const timer = setTimeout(() => finish("timeout"), DOOR_SENSOR_TIMEOUT_MS);
+    stop = listenForDoor(station, (rows) => {
+      if (!sawReturnOk && pickMatchingEvent(rows, { station, slot, since: sinceMs, match: isReturnDetected })) {
+        sawReturnOk = true;
+        setMsg("우산이 인식됐어요. 문이 닫힐 때까지 기다려 주세요.");
       }
-      if (!settled) finish("timeout");
-    })();
+      const closed = pickMatchingEvent(rows, { station, slot, since: sinceMs, match: isReturnDoorClosed });
+      if (!closed) return;
+      const action = String((closed.payload && closed.payload.action) || "");
+      finish(/timeout/i.test(action) ? "timeout" : "sensor");
+    });
   });
 }
 

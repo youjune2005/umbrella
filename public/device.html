@@ -16,14 +16,20 @@
   .link-pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;background:#e8eef5;color:#234}
   .link-pill.wifi{background:#E3F2FD;color:#0D47A1}
   .link-pill.wired{background:#FFF3E0;color:#E65100}
+  .sensor-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-top:12px}
+  .sensor-box{border:1px solid #e5e8eb;border-radius:12px;padding:12px;background:#fafbfc}
+  .sensor-box h3{margin:0 0 6px;font-size:13px;color:#667}
+  .sensor-box .val{font-size:18px;font-weight:800;letter-spacing:-0.02em}
+  .row-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+  .row-actions button{margin:0}
 </style>
 </head>
 <body>
-  <h1>장치 / 명령 테스트</h1>
+  <h1>장치 / 센서 테스트</h1>
   <p class="muted">
-    device 계정으로 로그인 후 슬롯 open 명령을 Firestore에 넣어요.<br>
-    <b>무선(기본):</b> 보드에 WiFi SSID를 넣고 스케치를 업로드하면 Firestore를 직접 폴링합니다.<br>
-    <b>유선 백업:</b> 시리얼 모니터를 닫은 뒤 <code>npm run bridge:firebase</code> (모니터가 포트를 점유하면 브리지가 실패합니다)
+    device 계정으로 로그인 후 서보·IR·RFID를 점검해요.<br>
+    <b>무선(기본):</b> 보드 WiFi + Firestore 폴링 · live 거점 <code>A1 / A7482 형남공학관</code><br>
+    <b>유선 백업:</b> 시리얼 모니터를 닫은 뒤 <code>npm run bridge:firebase</code>
   </p>
 
   <div class="card">
@@ -42,6 +48,24 @@
         <dt>MCU</dt><dd id="stMcu">—</dd>
       </dl>
     </div>
+    <div class="sensor-grid">
+      <div class="sensor-box">
+        <h3>IR 슬롯1 (하트비트)</h3>
+        <div class="val" id="irLive1">—</div>
+      </div>
+      <div class="sensor-box">
+        <h3>IR 슬롯2 (하트비트)</h3>
+        <div class="val" id="irLive2">—</div>
+      </div>
+      <div class="sensor-box">
+        <h3>마지막 IR 이벤트</h3>
+        <div class="val" id="irLast">—</div>
+      </div>
+      <div class="sensor-box">
+        <h3>마지막 RFID</h3>
+        <div class="val" id="rfidLast">—</div>
+      </div>
+    </div>
   </div>
 
   <div class="card">
@@ -54,8 +78,13 @@
         <label>slot</label>
         <select id="slot"></select>
       </div>
-      <div><button class="primary" id="btnOpen">문 열기 명령 보내기</button></div>
       <div><button class="ghost" id="btnRefresh">새로고침</button></div>
+    </div>
+    <div class="row-actions">
+      <button class="primary" id="btnOpen" type="button">문 열기</button>
+      <button class="ghost" id="btnClose" type="button">문 닫기</button>
+      <button class="ghost" id="btnIr" type="button">IR · 지금 읽기</button>
+      <button class="ghost" id="btnRfid" type="button">RFID · 15초 대기</button>
     </div>
     <p id="msg" class="muted"></p>
   </div>
@@ -75,14 +104,19 @@
 <script src="/firebase-config.js"></script>
 <script type="module">
 import {
-  getMode, loginDevice, openDoor, health, debugRecent, getDevicePresence, friendlyError,
-  STATIONS, MAX_HW_SLOT, stationQr, stationLabel,
-} from "/js/backend.js";
+  getMode, loginDevice, openDoor, health, debugRecent, getDevicePresence,
+  watchDevicePresence, getRecentDeviceEvent, friendlyError,
+  STATIONS, MAX_HW_SLOT, stationLabel,
+} from "/js/backend.js?v=96";
 
 const $ = (id) => document.getElementById(id);
-$("station").innerHTML = STATIONS.map((s) =>
-  `<option value="${s.code}">${s.qr || s.code} · ${s.name}</option>`
+const stationsOrdered = [...STATIONS].sort((a, b) => Number(!!b.live) - Number(!!a.live));
+$("station").innerHTML = stationsOrdered.map((s) =>
+  `<option value="${s.code}">${s.qr || s.code} · ${s.name}${s.live ? " · live" : ""}</option>`
 ).join("");
+// 기본: A7482 (형남공학관 live)
+const liveStation = STATIONS.find((s) => s.qr === "A7482") || STATIONS.find((s) => s.live) || STATIONS[0];
+if (liveStation) $("station").value = liveStation.code;
 $("slot").innerHTML = Array.from({ length: MAX_HW_SLOT }, (_, i) => `<option value="${i + 1}">${i + 1}</option>`).join("");
 
 let authed = false;
@@ -98,6 +132,12 @@ function fmtAge(ms) {
   if (ms < 60000) return `${Math.round(ms / 1000)}초 전`;
   if (ms < 3600000) return `${Math.round(ms / 60000)}분 전`;
   return `${Math.round(ms / 3600000)}시간 전`;
+}
+
+function irLabel(on) {
+  if (on === true) return `<span class="ok">감지(우산 있음)</span>`;
+  if (on === false) return `<span class="err">미감지(비어 있음)</span>`;
+  return "—";
 }
 
 function renderPresence(p) {
@@ -141,6 +181,32 @@ function renderPresence(p) {
   else $("stMcu").innerHTML = p.mcu_ok
     ? `<span class="ok">응답 있음</span>`
     : `<span class="err">응답 없음</span>`;
+
+  $("irLive1").innerHTML = p ? irLabel(!!p.ir1) : "—";
+  $("irLive2").innerHTML = p ? irLabel(!!p.ir2) : "—";
+}
+
+async function refreshSensorEvents() {
+  const station = $("station").value;
+  const slot = Number($("slot").value);
+  try {
+    const ir = await getRecentDeviceEvent({
+      station, slot, since: Date.now() - 10 * 60 * 1000,
+      match: (e) => e.kind === "ir",
+    });
+    if (ir) {
+      const present = !!(ir.payload && (ir.payload.present === true || ir.payload.present === "true"));
+      $("irLast").innerHTML = `${irLabel(present)} · ${slot}번 · ${new Date(ir.created_at).toLocaleTimeString()}`;
+    }
+    const rfid = await getRecentDeviceEvent({
+      station, slot, since: Date.now() - 10 * 60 * 1000,
+      match: (e) => e.kind === "rfid",
+    });
+    if (rfid) {
+      const uid = (rfid.payload && rfid.payload.uid) || "?";
+      $("rfidLast").textContent = `${uid} · ${slot}번 · ${new Date(rfid.created_at).toLocaleTimeString()}`;
+    }
+  } catch (_) { /* ignore */ }
 }
 
 async function refresh() {
@@ -154,35 +220,131 @@ async function refresh() {
     $("health").textContent = JSON.stringify({ mode: getMode(), ...h }, null, 2);
     $("recent").textContent = JSON.stringify(r, null, 2);
     renderPresence(presence);
+    await refreshSensorEvents();
   } catch (e) {
     $("health").textContent = friendlyError(e);
     renderPresence(null);
   }
 }
 
+async function sendAction(action, waitingText) {
+  await ensureAuth();
+  $("msg").textContent = waitingText || "보내는 중…";
+  const body = await openDoor({
+    station: $("station").value,
+    slot: Number($("slot").value),
+    action,
+    studentId: "device-test",
+  });
+  return body;
+}
+
+async function waitForEvent(kind, since, timeoutMs, label) {
+  const station = $("station").value;
+  const slot = Number($("slot").value);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ev = await getRecentDeviceEvent({
+      station, slot, since,
+      match: (e) => e.kind === kind,
+    });
+    if (ev) return ev;
+    $("msg").textContent = `${label} 대기 중… ${Math.max(0, Math.ceil((deadline - Date.now()) / 1000))}s`;
+    await new Promise((r) => setTimeout(r, 700));
+  }
+  return null;
+}
+
 $("btnOpen").onclick = async () => {
   try {
-    await ensureAuth();
-    $("msg").textContent = "보내는 중…";
-    const body = await openDoor({
-      station: $("station").value,
-      slot: Number($("slot").value),
-      action: "open",
-      studentId: "device-test",
-    });
-    $("msg").textContent = `OK · command id=${body.id} → 브리지/보드가 받으면 서보 동작`;
+    const body = await sendAction("test_open", "문 열기 명령 전송…");
+    $("msg").textContent = `열기 전송 · id=${body.id} → 센서와 무관하게 서보만 열립니다`;
     refresh();
   } catch (e) {
     $("msg").textContent = friendlyError(e);
   }
 };
+
+$("btnClose").onclick = async () => {
+  try {
+    const body = await sendAction("test_close", "문 닫기 명령 전송…");
+    $("msg").textContent = `닫기 전송 · id=${body.id} → 센서와 무관하게 서보만 닫힙니다`;
+    refresh();
+  } catch (e) {
+    $("msg").textContent = friendlyError(e);
+  }
+};
+
+$("btnIr").onclick = async () => {
+  try {
+    const since = Date.now();
+    const body = await sendAction("sense_ir", "IR 읽기 명령 전송…");
+    const ev = await waitForEvent("ir", since - 2000, 20000, "IR");
+    if (!ev) {
+      $("msg").textContent = `IR 응답 없음 (cmd=${body.id}). 보드 스케치를 최신으로 올렸는지 확인하세요.`;
+    } else {
+      const present = !!(ev.payload && (ev.payload.present === true || ev.payload.present === "true"));
+      $("msg").textContent = `IR OK · 슬롯 ${ev.slot} · ${present ? "감지(있음)" : "미감지(비어 있음)"}`;
+      $("irLast").innerHTML = `${irLabel(present)} · ${ev.slot}번 · ${new Date(ev.created_at).toLocaleTimeString()}`;
+    }
+    refresh();
+  } catch (e) {
+    $("msg").textContent = friendlyError(e);
+  }
+};
+
+$("btnRfid").onclick = async () => {
+  try {
+    const since = Date.now();
+    const body = await sendAction("sense_rfid", "RFID 대기 시작…");
+    $("msg").textContent = "카드를 리더에 대 주세요 (15초)…";
+    const ev = await waitForEvent("rfid", since - 2000, 18000, "RFID");
+    if (!ev) {
+      $("msg").textContent = `RFID 타임아웃 (cmd=${body.id}). 카드를 다시 대거나 스케치를 확인하세요.`;
+    } else {
+      const uid = (ev.payload && ev.payload.uid) || "?";
+      $("msg").textContent = `RFID OK · UID ${uid}`;
+      $("rfidLast").textContent = `${uid} · ${ev.slot}번 · ${new Date(ev.created_at).toLocaleTimeString()}`;
+    }
+    refresh();
+  } catch (e) {
+    $("msg").textContent = friendlyError(e);
+  }
+};
+
+let unwatchPresence = null;
+function startPresenceWatch() {
+  if (unwatchPresence) {
+    try { unwatchPresence(); } catch (_) { /* ignore */ }
+    unwatchPresence = null;
+  }
+  const station = $("station").value;
+  unwatchPresence = watchDevicePresence(station, (p) => {
+    renderPresence(p);
+  });
+}
+
 $("btnRefresh").onclick = refresh;
-$("station").onchange = refresh;
+$("station").onchange = () => {
+  startPresenceWatch();
+  refresh();
+};
+$("slot").onchange = refreshSensorEvents;
 
 (async () => {
   try { await ensureAuth(); } catch (e) { $("msg").textContent = friendlyError(e); }
+  startPresenceWatch();
   refresh();
-  setInterval(refresh, (window.UMBRELLA?.cost?.uiRefreshMs) || 5000);
+  // 헬스/최근로그만 주기 갱신 — IR·온라인은 onSnapshot이 실시간
+  setInterval(() => {
+    health().then((h) => {
+      $("health").textContent = JSON.stringify({ mode: getMode(), ...h }, null, 2);
+    }).catch(() => {});
+    debugRecent().then((r) => {
+      $("recent").textContent = JSON.stringify(r, null, 2);
+    }).catch(() => {});
+    refreshSensorEvents();
+  }, (window.UMBRELLA?.cost?.uiRefreshMs) || 2000);
 })();
 </script>
 </body>

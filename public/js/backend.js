@@ -29,8 +29,9 @@ import {
   getDocs,
   updateDoc,
   runTransaction,
+  onSnapshot,
 } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-firestore.js";
-import { pickMatchingEvent } from "/js/device-protocol.js";
+import { pickMatchingEvent } from "/js/device-protocol.js?v=96";
 
 // ---------- 공통 상수 / 유틸 ----------
 const cfg = window.UMBRELLA || {};
@@ -57,9 +58,9 @@ const FB_SESSION_KEY = "umbrella_fb_session";
  * live=true 만 대여·반납 가능 (나머지는 추후 지원 예정)
  */
 export const STATIONS = [
-  { code: "A1", qr: "A7482", name: "학생회관 정문", lat: 37.49678, lng: 126.95683, live: false },
+  { code: "A1", qr: "A7482", name: "형남공학관 2층 입구", lat: 37.49580, lng: 126.95648, live: true },
   { code: "B2", qr: "B3916", name: "중앙도서관 출입구", lat: 37.49623, lng: 126.95845, live: false },
-  { code: "C3", qr: "C8605", name: "형남공학관 2층 입구", lat: 37.49580, lng: 126.95648, live: true },
+  { code: "C3", qr: "C8605", name: "학생회관 정문", lat: 37.49678, lng: 126.95683, live: false },
 ];
 
 /** 세 핀 중심 — 실제 화면은 setBounds 로 맞춤 */
@@ -71,7 +72,7 @@ export function stationQr(code) {
   return (s && (s.qr || s.code)) || code || "—";
 }
 
-/** UI 표시: A7482 · 학생회관 정문 */
+/** UI 표시: A7482 · 형남공학관 2층 입구 */
 export function stationLabel(code) {
   const s = STATIONS.find((x) => x.code === code);
   if (!s) return code || "—";
@@ -210,9 +211,36 @@ function createLocalBackend() {
     async getDevicePresence(station = "A1") {
       return api("GET", `/api/device/presence?station=${station}`);
     },
+    watchDevicePresence(station, onChange) {
+      let stopped = false;
+      const tick = async () => {
+        if (stopped) return;
+        try { onChange(await this.getDevicePresence(station)); } catch (_) { /* ignore */ }
+        if (!stopped) setTimeout(tick, 1500);
+      };
+      tick();
+      return () => { stopped = true; };
+    },
     async getRecentDeviceEvent({ station, slot, since = 0, match } = {}) {
       const r = await api("GET", `/api/device/events?station=${encodeURIComponent(station)}&slot=${slot}&since=${Number(since) || 0}`);
       return pickMatchingEvent(r.events || [], { station, slot, since, match });
+    },
+    watchDeviceEvents(station, onChange) {
+      let stopped = false;
+      const tick = async () => {
+        if (stopped) return;
+        try {
+          const rows = [];
+          for (let slot = 1; slot <= MAX_HW_SLOT; slot++) {
+            const r = await api("GET", `/api/device/events?station=${encodeURIComponent(station)}&slot=${slot}&since=0`);
+            rows.push(...(r.events || []));
+          }
+          onChange(rows);
+        } catch (_) { /* ignore */ }
+        if (!stopped) setTimeout(tick, 300);
+      };
+      tick();
+      return () => { stopped = true; };
     },
     async debugRecent() { return api("GET", "/api/debug/recent"); },
     async health() { return api("GET", "/api/health"); },
@@ -516,10 +544,9 @@ function createFirebaseBackend() {
       return { ok: true, id: ref.id };
     },
 
-    async getDevicePresence(station = "A1") {
-      const ONLINE_MS = 20000; // 폴링 ~4초 기준, 20초 지나면 오프라인
-      const snap = await getDoc(doc(db, "stations", station));
-      if (!snap.exists()) {
+    _presenceFromSnap(station, snap) {
+      const ONLINE_MS = 60000;
+      if (!snap || !snap.exists()) {
         return { station, online: false, age_ms: null, last_seen: null, link: null, mcu_ok: false };
       }
       const data = snap.data() || {};
@@ -535,7 +562,28 @@ function createFirebaseBackend() {
         wifi_rssi: data.wifi_rssi ?? null,
         wifi_ip: data.wifi_ip || null,
         name: data.name || null,
+        ir1: data.ir1 === true,
+        ir2: data.ir2 === true,
       };
+    },
+
+    async getDevicePresence(station = "A1") {
+      const snap = await getDoc(doc(db, "stations", station));
+      return this._presenceFromSnap(station, snap);
+    },
+
+    /** stations/{code} 실시간 구독 — IR/온라인을 폴링보다 빠르게 반영 */
+    watchDevicePresence(station, onChange) {
+      const code = station || "A1";
+      return onSnapshot(
+        doc(db, "stations", code),
+        (snap) => {
+          try { onChange(this._presenceFromSnap(code, snap)); } catch (_) { /* ignore */ }
+        },
+        (err) => {
+          try { onChange({ station: code, online: false, error: String(err && err.message || err) }); } catch (_) { /* ignore */ }
+        }
+      );
     },
 
     /**
@@ -549,10 +597,27 @@ function createFirebaseBackend() {
           collection(db, "device_events"),
           where("station", "==", station),
           orderBy("created_at", "desc"),
-          limit(40)
+          limit(20)
         )
       );
       return pickMatchingEvent(snap.docs.map(docData), { station, slot, since, match });
+    },
+
+    /** 문 닫힘 이벤트를 폴링 대신 수신. 반환값은 구독 해제 함수 */
+    watchDeviceEvents(station, onChange) {
+      const qy = query(
+        collection(db, "device_events"),
+        where("station", "==", station),
+        orderBy("created_at", "desc"),
+        limit(20)
+      );
+      return onSnapshot(
+        qy,
+        (snap) => {
+          try { onChange(snap.docs.map(docData)); } catch (_) { /* ignore */ }
+        },
+        () => { /* 다음 스냅샷이나 타임아웃에 맡긴다 */ }
+      );
     },
 
     async debugRecent() {
@@ -601,7 +666,9 @@ export const fetchNextCommand = (s) => backend.fetchNextCommand(s);
 export const markCommandDone = (id) => backend.markCommandDone(id);
 export const postDeviceEvent = (p) => backend.postDeviceEvent(p);
 export const getRecentDeviceEvent = (p) => backend.getRecentDeviceEvent(p);
+export const watchDeviceEvents = (station, cb) => backend.watchDeviceEvents(station, cb);
 export const getDevicePresence = (s) => backend.getDevicePresence(s);
+export const watchDevicePresence = (s, cb) => backend.watchDevicePresence(s, cb);
 export const debugRecent = () => backend.debugRecent();
 export const health = () => backend.health();
 
