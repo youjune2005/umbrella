@@ -16,7 +16,7 @@ import {
   RENT_LIMIT_MS,
   overdueFeeWon,
   STATIONS,
-} from "/js/backend.js?v=96";
+} from "/js/backend.js?v=100";
 import { startQrScan, stopQrScan, setScanCooldown, setTorch, getTorchOn, fitQrVideoCover } from "/js/qr-scan.js?v=49";
 import {
   initCampusMap,
@@ -28,11 +28,14 @@ import {
 } from "/js/map-view.js?v=92";
 import { initUiScale, updateUiScale, setShellScrollLock } from "/js/ui-scale.js?v=64";
 import {
-  isRentDoorClosed,
+  isRentDoorSettled,
+  isRentDoorTimeout,
   isReturnDetected,
-  isReturnDoorClosed,
+  isReturnDoorSettled,
+  isReturnDoorTimeout,
+  isServoStarted,
   pickMatchingEvent,
-} from "/js/device-protocol.js?v=96";
+} from "/js/device-protocol.js?v=97";
 
 initUiScale();
 
@@ -57,7 +60,7 @@ const STATION_BY_KEY = (() => {
 const STATION_QR = Object.fromEntries(STATIONS.map((s) => [s.code, s.qr || s.code]));
 const $ = (id) => document.getElementById(id);
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-const DOOR_MS = 720;
+const DOOR_MS = 1400;
 const QR_CONFIRM_HITS = 3; // 같은 코드가 연속 인식돼야 확정
 /** 보드 자동닫힘 대기 (아두이노 OPEN_MAX ≈ 25s + 여유) */
 const DOOR_SENSOR_TIMEOUT_MS = 45000;
@@ -651,33 +654,48 @@ function listenForDoor(station, onRows) {
   }
 }
 
-/** 대여: IR로 우산이 사라진 뒤 보드가 문을 닫을 때까지 대기 */
-function waitForRentDoorClose(station, slot, sinceMs) {
+function waitForMatching(station, slot, sinceMs, commandId, match, timeoutMs) {
   return new Promise((resolve) => {
     let settled = false;
     let stop = () => {};
-    const finish = (how) => {
+    const finish = (ev) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       try { stop(); } catch (_) { /* ignore */ }
-      resolve(how);
+      resolve(ev || null);
     };
-    const timer = setTimeout(() => finish("timeout"), DOOR_SENSOR_TIMEOUT_MS);
+    const timer = setTimeout(() => finish(null), timeoutMs);
     stop = listenForDoor(station, (rows) => {
-      const ev = pickMatchingEvent(rows, { station, slot, since: sinceMs, match: isRentDoorClosed });
-      if (!ev) return;
-      const action = String((ev.payload && ev.payload.action) || "");
-      finish(/timeout/i.test(action) ? "timeout" : "sensor");
+      const ev = pickMatchingEvent(rows, { station, slot, since: sinceMs, commandId, match });
+      if (ev) finish(ev);
     });
   });
+}
+
+/** 서보 시작 이벤트. 없으면 null. 화면이 먼저 열렸다고 말하지 않기 위한 확인 */
+function waitForServoStart(station, slot, sinceMs, commandId, action) {
+  return waitForMatching(
+    station, slot, sinceMs, commandId,
+    (ev) => isServoStarted(ev, action),
+    15000
+  );
+}
+
+/** 대여: 이번 commandId 의 닫힘만 인정. 타임아웃 이벤트는 성공이 아니다. */
+function waitForRentDoorClose(station, slot, sinceMs, commandId) {
+  return waitForMatching(station, slot, sinceMs, commandId, isRentDoorSettled, DOOR_SENSOR_TIMEOUT_MS)
+    .then((ev) => {
+      if (!ev) return "unknown";
+      return isRentDoorTimeout(ev) ? "timeout" : "sensor";
+    });
 }
 
 /**
  * 반납: RFID+IR 인식(return_ok) 후 보드 자동닫힘(auto_close_return)까지 대기.
  * 수동 「우산을 넣었어요」는 보드 없이 닫기 위한 폴백.
  */
-function waitForReturnDoorClose(station, slot, sinceMs) {
+function waitForReturnDoorClose(station, slot, sinceMs, commandId) {
   return new Promise((resolve) => {
     let settled = false;
     let sawReturnOk = false;
@@ -691,16 +709,19 @@ function waitForReturnDoorClose(station, slot, sinceMs) {
       resolve(how);
     };
     returnWaitResolve = () => finish("manual");
-    const timer = setTimeout(() => finish("timeout"), DOOR_SENSOR_TIMEOUT_MS);
+    const timer = setTimeout(() => finish("unknown"), DOOR_SENSOR_TIMEOUT_MS);
     stop = listenForDoor(station, (rows) => {
-      if (!sawReturnOk && pickMatchingEvent(rows, { station, slot, since: sinceMs, match: isReturnDetected })) {
+      if (!sawReturnOk && pickMatchingEvent(rows, {
+        station, slot, since: sinceMs, commandId, match: isReturnDetected,
+      })) {
         sawReturnOk = true;
         setMsg("우산이 인식됐어요. 문이 닫힐 때까지 기다려 주세요.");
       }
-      const closed = pickMatchingEvent(rows, { station, slot, since: sinceMs, match: isReturnDoorClosed });
+      const closed = pickMatchingEvent(rows, {
+        station, slot, since: sinceMs, commandId, match: isReturnDoorSettled,
+      });
       if (!closed) return;
-      const action = String((closed.payload && closed.payload.action) || "");
-      finish(/timeout/i.test(action) ? "timeout" : "sensor");
+      finish(isReturnDoorTimeout(closed) ? "timeout" : "sensor");
     });
   });
 }
@@ -715,13 +736,14 @@ async function playDoorOpen(slot) {
   }
   if (!el) return;
   el.classList.remove("closing", "open", "opening");
+  el.style.transitionDuration = `${DOOR_MS}ms`;
   void el.offsetWidth;
   el.classList.add("opening", "open");
   await wait(DOOR_MS);
   el.classList.remove("opening");
 }
 
-/** 열린 상태에서 같은 요소로 닫기 transition */
+/** 열린 상태에서 같은 요소로 닫기. 서보와 같이 약 1.3초. */
 async function playDoorClose(slot) {
   const el = doorEl(slot);
   if (!el) {
@@ -730,6 +752,7 @@ async function playDoorClose(slot) {
   }
   el.classList.remove("opening");
   el.classList.add("open");
+  el.style.transitionDuration = `${DOOR_MS}ms`;
   void el.offsetWidth;
   el.classList.add("closing");
   el.classList.remove("open");
@@ -758,21 +781,23 @@ async function go() {
     if (isReturn) {
       const openedAt = Date.now();
       const rentalSnap = state.user.activeRental;
-      await returnUmbrella(params);
-      // 타이머 UI는 반납 완료 배너까지 유지 (서버 activeRental 은 이미 해제)
+      const ret = await returnUmbrella(params);
+      const cmdId = ret && ret.id;
       state.returning = true;
       state.busy = false;
       syncPickActions();
-      setMsg(`${slot}번 문이 열렸어요. 우산을 걸어 넣어 주세요.`);
+      setMsg(`${slot}번 문을 열어요. 우산을 걸어 넣어 주세요.`);
+      const closePromise = waitForReturnDoorClose(state.station, slot, openedAt, cmdId);
       await playDoorOpen(slot);
       render();
 
-      const how = await waitForReturnDoorClose(state.station, slot, openedAt);
+      const how = await closePromise;
       if (how === "sensor") setMsg("문이 닫히는 중이에요…");
       else if (how === "manual") setMsg("확인됐어요. 문을 닫을게요.");
-      else setMsg("보드 응답이 없어 문을 닫을게요.");
+      else if (how === "timeout") setMsg("시간 안에 반납이 확인되지 않아 문이 닫혔어요. 반납 기록은 남아 있어요.");
+      else setMsg("보드가 반납 완료를 확인하지 못했어요. 반납 기록은 남아 있어요.");
 
-      await playDoorClose(slot);
+      if (how === "sensor" || how === "manual") await playDoorClose(slot);
       state.returning = false;
       syncPickActions();
       state.user.activeRental = null;
@@ -780,13 +805,15 @@ async function go() {
       state.busy = false;
       state.selected = null;
       returnWaitResolve = null;
-      setMsg("");
-      showReturnDone({
-        rental: rentalSnap,
-        returnStation: state.station,
-        returnSlot: slot,
-        returnedAt: Date.now(),
-      });
+      if (how === "sensor" || how === "manual") {
+        setMsg("");
+        showReturnDone({
+          rental: rentalSnap,
+          returnStation: state.station,
+          returnSlot: slot,
+          returnedAt: Date.now(),
+        });
+      }
       returnUiDone = true;
     } else {
       const r = await rentUmbrella(params);
@@ -795,16 +822,16 @@ async function go() {
         rented_at: r.rented_at, due_at: r.due_at,
       };
       const openedAt = Date.now();
-      setMsg(`${slot}번 문이 열렸어요. 우산을 꺼내 주세요.`);
-      await playDoorOpen(slot);
+      const cmdId = r && r.id;
+      setMsg(`${slot}번 문을 열어요. 우산을 꺼내 주세요.`);
       render();
+      const closePromise = waitForRentDoorClose(state.station, slot, openedAt, cmdId);
+      await playDoorOpen(slot);
 
-      // 아두이노 IR: 우산이 사라지면 auto_close → 그때 앱도 닫고 홈으로
-      const how = await waitForRentDoorClose(state.station, slot, openedAt);
+      const how = await closePromise;
       if (how === "sensor") setMsg("우산을 꺼냈어요. 문이 닫히는 중이에요…");
-      else setMsg("보드 응답이 없어 문을 닫을게요.");
 
-      await playDoorClose(slot);
+      if (how === "sensor") await playDoorClose(slot);
       await refreshInventory();
       state.busy = false;
       state.selected = null;
@@ -812,6 +839,8 @@ async function go() {
       tick();
       syncUserChrome();
       goTab("home");
+      if (how === "timeout") setMsg("시간 안에 우산이 확인되지 않아 문이 닫혔어요. 대여 기록은 남아 있어요.");
+      else if (how !== "sensor") setMsg("보드가 대여 완료를 확인하지 못했어요. 대여 기록은 남아 있어요.");
       returnUiDone = true;
     }
   } catch (e) {

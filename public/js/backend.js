@@ -31,7 +31,7 @@ import {
   runTransaction,
   onSnapshot,
 } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-firestore.js";
-import { pickMatchingEvent } from "/js/device-protocol.js?v=96";
+import { pickMatchingEvent } from "/js/device-protocol.js?v=97";
 
 // ---------- 공통 상수 / 유틸 ----------
 const cfg = window.UMBRELLA || {};
@@ -552,9 +552,11 @@ function createFirebaseBackend() {
       const data = snap.data() || {};
       const last = Number(data.last_seen) || 0;
       const age = last ? Date.now() - last : null;
+      // 보드 시계가 몇 초 빠르면 age가 음수다. 그 경우도 방금 신호로 본다.
+      const online = !!(last && age != null && age <= ONLINE_MS && age >= -20000);
       return {
         station,
-        online: !!(last && age != null && age <= ONLINE_MS),
+        online,
         age_ms: age,
         last_seen: last || null,
         link: data.link || null,
@@ -564,6 +566,8 @@ function createFirebaseBackend() {
         name: data.name || null,
         ir1: data.ir1 === true,
         ir2: data.ir2 === true,
+        rfid1: data.rfid1 || "",
+        rfid2: data.rfid2 || "",
       };
     },
 

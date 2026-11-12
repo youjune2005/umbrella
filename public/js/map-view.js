@@ -2,7 +2,7 @@
  * 숭실대 캠퍼스 우산 보관함 지도 (카카오맵 JS SDK)
  * 키: window.UMBRELLA.kakaoMapAppKey (firebase-config.js)
  */
-import { STATIONS, CAMPUS_CENTER, MAX_HW_SLOT, TOTAL_SLOTS } from "/js/backend.js?v=96";
+import { STATIONS, CAMPUS_CENTER, MAX_HW_SLOT, TOTAL_SLOTS } from "/js/backend.js?v=98";
 
 let map = null;
 let overlays = {};

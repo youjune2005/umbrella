@@ -10,6 +10,7 @@
  *   PC → MCU : PING | OPEN <slot>
  *   MCU → PC : PONG | ACK OPEN n | DONE OPEN n | EVENT RFID n UID | EVENT IR n | EVENT SERVO n action
  */
+const { createPollGate, dispatchOutcome } = require("./poll-gate.cjs");
 const { SerialPort } = require("serialport");
 const { ReadlineParser } = require("@serialport/parser-readline");
 const fs = require("fs");
@@ -190,7 +191,9 @@ async function main() {
   const port = new SerialPort({ path: serialPath, baudRate: BAUD });
   const parser = port.pipe(new ReadlineParser({ delimiter: "\n" }));
 
-  let pending = null; // { id, timer }
+  let pending = null; // { id, slot, timer, acked }
+  const slotCmd = Object.create(null); // 슬롯별 진행 중 command id (DONE 이후 이벤트에도 유지)
+  const pollGate = createPollGate();
   let lastPong = 0;
 
   const send = (line) => {
@@ -203,17 +206,21 @@ async function main() {
     const { id, timer } = pending;
     clearTimeout(timer);
     pending = null;
+    const outcome = dispatchOutcome(reason);
     try {
+      // 재전송을 막기 위해 done 은 찍는다. timeout 은 성공이 아니라 결과 불명이다.
       await api.done(id);
-      console.log(`[cmd] done id=${id} (${reason})`);
+      console.log(`[cmd] ${outcome} id=${id} (${reason})`);
     } catch (e) {
       console.error("[cmd] done 실패:", e.message);
     }
   }
 
   async function sendEvent(slot, kind, payload) {
+    const cmd = slotCmd[slot] || (payload && payload.cmd) || "";
+    const body = cmd ? { ...payload, cmd } : payload;
     try {
-      await api.event({ station: STATION, slot, kind, payload });
+      await api.event({ station: STATION, slot, kind, payload: body, ...(cmd ? { cmd } : {}) });
     } catch (e) {
       console.error("[event] 실패:", e.message);
     }
@@ -221,12 +228,12 @@ async function main() {
 
   const handlers = [
     [/^PONG\b/i, () => { lastPong = Date.now(); }],
-    [/^DONE\s+OPEN(?:_RETURN)?\s+\d+/i, () => finish("mcu")],
-    [/^EVENT\s+RFID\s+(\d+)\s+(\S+)/i, (m) => sendEvent(Number(m[1]), "rfid", { uid: m[2] })],
+    [/^DONE\s+(?:OPEN(?:_RETURN)?|TEST_OPEN|TEST_CLOSE)\s+\d+/i, () => finish("mcu")],
+    [/^EVENT\s+RFID\s+(\d+)\s+(\S+)(?:\s+(\S+))?/i, (m) => sendEvent(Number(m[1]), "rfid", { uid: m[2], ...(m[3] ? { cmd: m[3] } : {}) })],
     [/^EVENT\s+IR\s+(\d+)\s+(\d+)/i, (m) => sendEvent(Number(m[1]), "ir", { present: m[2] === "1", source: "sense_ir" })],
     [/^EVENT\s+IR\s+(\d+)/i, (m) => sendEvent(Number(m[1]), "ir", { present: true, source: "sense_ir" })],
-    [/^EVENT\s+RETURN_OK\s+(\d+)/i, (m) => sendEvent(Number(m[1]), "return_ok", { source: "rfid_ir" })],
-    [/^EVENT\s+SERVO\s+(\d+)\s+(\S+)/i, (m) => sendEvent(Number(m[1]), "servo", { action: m[2], deg: 90 })],
+    [/^EVENT\s+RETURN_OK\s+(\d+)(?:\s+(\S+))?/i, (m) => sendEvent(Number(m[1]), "return_ok", { via: "rfid_ir", ...(m[2] ? { cmd: m[2] } : {}) })],
+    [/^EVENT\s+SERVO\s+(\d+)\s+(\S+)(?:\s+(\S+))?/i, (m) => sendEvent(Number(m[1]), "servo", { action: m[2], deg: 90, ...(m[3] ? { cmd: m[3] } : {}) })],
   ];
 
   parser.on("data", (raw) => {
@@ -246,8 +253,8 @@ async function main() {
   setInterval(() => send("PING"), PING_MS);
 
   let lastPresence = 0;
-  setInterval(async () => {
-    if (pending) return;
+  async function pollOnce() {
+    if (pending || !pollGate.tryEnter()) return;
     const mcuOk = !!(lastPong && Date.now() - lastPong <= PING_MS * 4);
     if (lastPong && !mcuOk) {
       console.warn("[warn] MCU 응답 없음 — USB/스케치 확인");
@@ -259,36 +266,41 @@ async function main() {
         await api.presence({ mcu_ok: mcuOk });
       }
       const body = await api.next();
-      if (!body || !body.has) return;
+      if (!body || !body.has || pending) return;
+      slotCmd[body.slot] = body.id;
       pending = {
         id: body.id,
+        slot: body.slot,
         timer: setTimeout(() => finish("timeout"), CMD_TIMEOUT_MS),
       };
       const action = String(body.action || "open");
+      const tag = `${body.slot} ${body.id}`;
       if (action === "sense_ir") {
         send(`SENSE_IR ${body.slot}`);
         await finish("sense_ir");
       } else if (action === "sense_rfid") {
         send(`SENSE_RFID ${body.slot}`);
-        // RFID는 보드가 카드 읽을 때까지 창이 열림 — timeout 으로 done
       } else if (action === "test_open") {
-        send(`TEST_OPEN ${body.slot}`);
+        send(`TEST_OPEN ${tag}`);
         await finish("test_open");
       } else if (action === "test_close") {
-        send(`TEST_CLOSE ${body.slot}`);
+        send(`TEST_CLOSE ${tag}`);
         await finish("test_close");
       } else if (action === "open_return") {
-        send(`OPEN_RETURN ${body.slot}`);
+        send(`OPEN_RETURN ${tag}`);
       } else if (action === "open") {
-        send(`OPEN ${body.slot}`);
+        send(`OPEN ${tag}`);
       } else {
         console.warn("[cmd] unknown action", action);
         await finish("unknown");
       }
     } catch (e) {
       console.error("[poll]", e.message);
+    } finally {
+      pollGate.leave();
     }
-  }, POLL_MS);
+  }
+  setInterval(() => { pollOnce(); }, POLL_MS);
 }
 
 main().catch((e) => {
